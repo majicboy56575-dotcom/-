@@ -1,0 +1,132 @@
+import json
+from googleapiclient.discovery import build
+from youtube_transcript_api import YouTubeTranscriptApi
+
+class YouTubeAnalyzer:
+    def __init__(self, api_key: str = None):
+        """
+        api_key: Google Cloud Console에서 발급받은 YouTube Data API v3 키
+                 (API 키 없이 자막만 추출하려면 None으로 두어도 됨)
+        """
+        self.api_key = api_key
+        self.youtube = build("youtube", "v3", developerKey=api_key) if api_key else None
+
+    def get_transcript(self, video_id: str, languages=('ko', 'en')):
+        """1. 자막 및 타임스탬프 추출"""
+        try:
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
+            full_text = " ".join([entry['text'] for entry in transcript_list])
+            
+            segments = []
+            for entry in transcript_list:
+                start_sec = int(entry['start'])
+                m, s = divmod(start_sec, 60)
+                segments.append({
+                    "time": f"{m:02d}:{s:02d}",
+                    "text": entry['text'],
+                    "duration": round(entry['duration'], 2)
+                })
+                
+            return {
+                "status": "success",
+                "full_text": full_text,
+                "segments": segments
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"자막을 불러올 수 없습니다: {str(e)}"
+            }
+
+    def get_metadata_and_comments(self, video_id: str, max_comments: int = 50):
+        """2. 메타데이터 및 주요 댓글 수집"""
+        if not self.youtube:
+            return {"status": "skipped", "message": "API 키가 설정되지 않아 통계 수집을 건너뜁니다."}
+
+        try:
+            # 기본 영상 메타데이터 및 통계
+            video_res = self.youtube.videos().list(
+                part="snippet,statistics",
+                id=video_id
+            ).execute()
+
+            if not video_res.get("items"):
+                return {"status": "error", "message": "영상을 찾을 수 없습니다."}
+
+            item = video_res["items"][0]
+            snippet = item["snippet"]
+            stats = item["statistics"]
+
+            # 댓글 수집 (관련성/인기순)
+            comments = []
+            try:
+                comment_res = self.youtube.commentThreads().list(
+                    part="snippet",
+                    videoId=video_id,
+                    maxResults=min(max_comments, 100),
+                    order="relevance"
+                ).execute()
+
+                for c in comment_res.get("items", []):
+                    top = c["snippet"]["topLevelComment"]["snippet"]
+                    comments.append({
+                        "author": top["authorDisplayName"],
+                        "text": top["textDisplay"],
+                        "like_count": top["likeCount"],
+                        "published_at": top["publishedAt"]
+                    })
+            except Exception as comment_err:
+                comments = f"댓글 수집 불가 (비활성화 등): {str(comment_err)}"
+
+            return {
+                "status": "success",
+                "title": snippet.get("title"),
+                "channel": snippet.get("channelTitle"),
+                "published_at": snippet.get("publishedAt"),
+                "views": int(stats.get("viewCount", 0)),
+                "likes": int(stats.get("likeCount", 0)),
+                "comment_count": int(stats.get("commentCount", 0)),
+                "top_comments": comments
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def analyze(self, video_id: str):
+        """종합 분석 실행"""
+        print(f"[{video_id}] 분석 시작...")
+        
+        transcript_data = self.get_transcript(video_id)
+        metadata = self.get_metadata_and_comments(video_id)
+
+        return {
+            "video_id": video_id,
+            "metadata": metadata,
+            "transcript": transcript_data
+        }
+
+
+# ==========================================
+# 실행 예시
+# ==========================================
+if __name__ == "__main__":
+    # 1. API 키 입력 (자막만 필요하면 None으로 두어도 작동)
+    YOUTUBE_API_KEY = "YOUR_YOUTUBE_API_KEY" 
+    
+    # 2. 분석할 유튜브 영상 ID (URL 끝 v= 뒷부분)
+    TARGET_VIDEO_ID = "YOUR_VIDEO_ID"
+
+    analyzer = YouTubeAnalyzer(api_key=YOUTUBE_API_KEY)
+    result = analyzer.analyze(TARGET_VIDEO_ID)
+
+    # 결과 출력
+    if result["metadata"].get("status") == "success":
+        meta = result["metadata"]
+        print(f"\n제목: {meta['title']}")
+        print(f"조회수: {meta['views']:,}회 | 좋아요: {meta['likes']:,}개")
+        print(f"수집된 상위 댓글 수: {len(meta['top_comments'])}개")
+
+    if result["transcript"].get("status") == "success":
+        print(f"추출된 자막 글자 수: {len(result['transcript']['full_text'])}자")
+        print("첫 자막 구간:", result["transcript"]["segments"][:2])
+    else:
+        print(result["transcript"]["message"])
